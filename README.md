@@ -1,98 +1,203 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# ReactionsService — документация
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Модуль реакций (эмодзи) на сообщения в чате. Часть микросервиса чатов, отвечает за добавление, удаление и получение агрегированных реакций на сообщение, с хранением в Cassandra, кешированием в Redis, проверкой членства в чате через gRPC и рассылкой событий об изменении реакций через RabbitMQ.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+---
 
-## Description
+## 1. Общее описание
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+Модуль `ReactionsModule` объединяет:
 
-## Project setup
+- **`ReactionsController`** — REST-эндпоинты `POST/DELETE/GET /messages/:messageId/reactions`;
+- **`ReactionsService`** — бизнес-логика работы с реакциями;
+- **`ReactionDto`** — валидация тела запроса на добавление реакции.
 
-```bash
-$ npm install
+### 1.1. Зависимости `ReactionsService`
+
+| Зависимость | Назначение |
+|---|---|
+| `CassandraService` | Хранилище реакций (таблица `message_reactions`) — источник истины |
+| `ChatsClientService` | gRPC-клиент к сервису чатов: проверка членства (`isMember`) и получение списка участников (`getChatMembers`) |
+| `RedisService` | Кеш агрегированных реакций по сообщению + распределённая блокировка от дублей |
+| `ClientProxy` (`RABBITMQ_SERVICE`) | Публикация события `message.reaction` для доставки уведомлений участникам чата (например, через WebSocket-шлюз) |
+
+### 1.2. Импортируемые модули (`ReactionsModule`)
+
+- `RedisModule`, `CassandraModule`, `ChatsClientModule` — инфраструктурные зависимости.
+- `ClientsModule.registerAsync` с транспортом `Transport.RMQ` — асинхронная регистрация клиента RabbitMQ (`RABBITMQ_SERVICE`) с очередью `chat_events` (durable), URL брокера берётся из `RABBITMQ_URL`.
+
+### 1.3. Почему `ChatsClientService` используется, а не прямой запрос к БД чатов
+
+`ChatsClientService` — gRPC-клиент (`ClientGrpc`, сервис `ChatInternal`), инкапсулирующий два вызова:
+
+- `isMember(chatId, userId): Promise<boolean>` — проверка, состоит ли пользователь в чате;
+- `getChatMembers(chatId): Promise<string[]>` — список `userId` всех участников чата.
+
+Это межсервисное взаимодействие: `Reactions`-модуль не хранит и не знает структуру данных о чатах и их участниках — он делегирует это отдельному Chat-сервису по внутреннему gRPC-протоколу.
+
+---
+
+## 2. `ReactionsController`
+
+`@Controller('messages/:messageId/reactions')`, весь контроллер защищён `@UseGuards(JwtAuthGuard)` — все три эндпоинта требуют авторизации.
+
+### 2.1. `POST /messages/:messageId/reactions` — `add(req, messageId, dto)`
+
+- Тело запроса валидируется `ReactionDto`: `chatId` (UUID), `emoji` (строка 1–8 символов — с запасом под многобайтовые эмодзи-последовательности, например составные эмодзи с ZWJ).
+- `userId` берётся не из тела запроса, а из `req.user.userId` (payload JWT) — клиент не может добавить реакцию от чужого имени.
+- Делегирует в `reactionsService.addReaction(dto.chatId, messageId, req.user.userId, dto.emoji)`.
+
+### 2.2. `DELETE /messages/:messageId/reactions` — `remove(req, messageId, chatId)`
+
+- `chatId` читается напрямую из тела запроса через `@Body('chatId')`, **без DTO и без валидации** (в отличие от `add`).
+- Удаляет реакцию текущего пользователя (`req.user.userId`) на сообщение.
+
+### 2.3. `GET /messages/:messageId/reactions` — `list(messageId)`
+
+- Публичный (в рамках модуля) для любого авторизованного пользователя эндпоинт, возвращает агрегированную сводку реакций по сообщению. Проверка членства в чате **не выполняется** (см. раздел 5.3).
+
+---
+
+## 3. `ReactionsService` — методы
+
+### 3.1. `addReaction(chatId, messageId, userId, emoji): Promise<{...}>`
+
+Добавляет (или заменяет) реакцию пользователя на сообщение.
+
+**Логика:**
+1. **Дедупликация быстрых повторных кликов.** Формирует ключ блокировки `reaction_lock:{messageId}:{userId}:{emoji}` и пытается атомарно установить его в Redis командой `SET ... EX 3 NX` (успех — только если ключа ещё нет). Если ключ уже существует (пользователь уже отправил ту же самую реакцию в последние 3 секунды) — метод сразу возвращает `{ chatId, messageId, userId, emoji, duplicate: true }`, не обращаясь к Cassandra и не эмитируя событие.
+2. **Проверка членства в чате.** Через gRPC (`chatsClient.isMember`) проверяет, что пользователь состоит в чате `chatId`. Если нет — `ForbiddenException('Вы не состоите в этом чате')`.
+3. **Запись в Cassandra.** Вставляет строку в `message_reactions` (`message_id`, `user_id`, `chat_id`, `emoji`, `created_at`), используя prepared statement.
+4. **Инвалидация кеша.** Удаляет `reactions_cache:{messageId}` из Redis, чтобы следующий `getReactions` перечитал актуальные данные.
+5. **Рассылка уведомления.** Получает список участников чата (`getChatMembers`) и публикует в RabbitMQ событие `message.reaction` с полями `{ chatId, messageId, userId, emoji, action: 'add', recipientIds }` — вероятно, для последующей доставки push/WebSocket-уведомлений подписанным клиентам.
+6. Возвращает `{ chatId, messageId, userId, emoji }` (без `duplicate`).
+
+**Исключения:**
+- `ForbiddenException` — пользователь не состоит в чате.
+
+**Особенность модели данных:** судя по запросу `DELETE ... WHERE message_id = ? AND user_id = ?` (без `emoji` в условии), таблица `message_reactions`, по всей видимости, имеет составной первичный ключ `(message_id, user_id)` — то есть **один пользователь может иметь только одну активную реакцию на сообщение**; повторный `addReaction` с другим `emoji` просто перезаписывает предыдущую реакцию того же пользователя (аналогично поведению реакций в Slack/Telegram).
+
+### 3.2. `removeReaction(chatId, messageId, userId): Promise<{...}>`
+
+Удаляет реакцию пользователя на сообщение.
+
+**Логика:**
+1. Проверка членства в чате (`isMember`) — иначе `ForbiddenException`.
+2. Удаляет строку из `message_reactions` по `message_id` и `user_id` (то есть удаляет **любую** реакцию пользователя на это сообщение, независимо от конкретного эмодзи — параметр `emoji` в метод даже не передаётся).
+3. Инвалидирует кеш `reactions_cache:{messageId}`.
+4. Получает участников чата и публикует событие `message.reaction` с `action: 'remove'` (без поля `emoji`, так как оно неизвестно на момент удаления).
+5. Возвращает `{ chatId, messageId, userId }`.
+
+**Отличие от `addReaction`:** здесь **нет** Redis-блокировки от дублей (`reaction_lock`) — повторный быстрый вызов `removeReaction` просто выполнит второй `DELETE` (идемпотентно на уровне Cassandra) и второй раз опубликует событие `message.reaction` с `action: 'remove'`, что может привести к дублирующимся уведомлениям на клиенте.
+
+### 3.3. `getReactions(messageId): Promise<Record<string, string[]>>`
+
+Возвращает агрегированную сводку реакций на сообщение в формате `{ emoji: [userId, userId, ...] }`.
+
+**Логика (cache-aside):**
+1. Пытается прочитать `reactions_cache:{messageId}` из Redis; при наличии — возвращает распарсенный JSON немедленно.
+2. При отсутствии кеша — выполняет `SELECT user_id, emoji FROM message_reactions WHERE message_id = ?` в Cassandra.
+3. Группирует результат по `emoji`, собирая массив `user_id` (приводя каждый к строке — `user_id` в Cassandra, вероятно, хранится как `uuid`/`timeuuid`, а не `text`).
+4. Сохраняет сводку в Redis с TTL 60 секунд.
+5. Возвращает сводку.
+
+**Важно:** в отличие от `ProfileService` (см. документацию `UserService`), здесь ключ кеша формируется и читается, и удаляется **одинаково и без опечаток** (`reactions_cache:${messageId}` везде) — инвалидация в `addReaction`/`removeReaction` работает корректно.
+
+---
+
+## 4. `ReactionDto`
+
+```ts
+class ReactionDto {
+  @IsUUID()
+  chatId!: string;
+
+  @IsString()
+  @MinLength(1)
+  @MaxLength(8)
+  emoji!: string;
+}
 ```
 
-## Compile and run the project
+- `chatId` — обязателен, должен быть валидным UUID.
+- `emoji` — строка от 1 до 8 символов. Ограничение длины, вероятно, рассчитано на составные Unicode-эмодзи (например, эмодзи с модификатором тона кожи или ZWJ-последовательности могут занимать несколько code units), но явного `@Matches` на допустимый набор символов (только эмодзи) нет — теоретически можно отправить любую короткую строку (например, `":)"` или `"lol"`) как «эмодзи».
 
-```bash
-# development
-$ npm run start
+Используется только в `POST`-эндпоинте; `DELETE` принимает `chatId` без валидации вообще (см. ниже).
 
-# watch mode
-$ npm run start:dev
+---
 
-# production mode
-$ npm run start:prod
+## 5. Замечания и потенциальные проблемы
+
+### 5.1. Блокировка от дублей устанавливается до проверки прав
+
+В `addReaction` ключ `reaction_lock:...` выставляется **до** проверки `isMember`. Если пользователь не состоит в чате и запрос отклонён (`ForbiddenException`), лок всё равно занят на 3 секунды. Это не критично для безопасности, но может ненадолго помешать легитимному повторному запросу сразу после исправления членства (например, если пользователя добавили в чат прямо во время гонки запросов).
+
+### 5.2. `removeReaction` не защищён от дублей и не привязан к конкретному эмодзи
+
+`DELETE` удаляет **любую** реакцию пользователя на сообщение, не проверяя, какая именно реакция была установлена. В сочетании с отсутствием Redis-блокировки (как в `addReaction`) при двойном клике/повторной отправке возможна публикация двух одинаковых событий `message.reaction` с `action: 'remove'`.
+
+### 5.3. `chatId` в `remove` не валидируется, а в `list` членство не проверяется вовсе
+
+- В `POST` `chatId` проходит через `ReactionDto` (`@IsUUID()`), а в `DELETE` берётся напрямую (`@Body('chatId')`) без какой-либо валидации формата — некорректная строка дойдёт до gRPC-вызова `isMember` и, скорее всего, приведёт к необработанной ошибке на уровне транспорта, а не к аккуратному `400 Bad Request`.
+- В `GET /messages/:messageId/reactions` (`list`) вообще **не запрашивается `chatId`** и не выполняется проверка `isMember` — любой авторизованный пользователь системы (даже не состоящий в чате) может получить сводку реакций на любое `messageId`, если он его знает. Если реакции на сообщения в приватных чатах должны быть доступны только участникам, это дыра в контроле доступа, которую стоит закрыть (например, добавляя `chatId` как query-параметр и проверяя членство так же, как в `add`/`remove`).
+
+### 5.4. Нет проверки, что `messageId` действительно принадлежит `chatId`
+
+И `addReaction`, и `removeReaction` проверяют лишь то, что пользователь состоит **в указанном им самим `chatId`**, но никак не проверяют, что сообщение `messageId` действительно относится к этому чату. Технически участник чата A может отправить запрос с `chatId = <чат A>` и `messageId = <ID сообщения из чата B>` (если каким-то образом узнает этот ID) — проверка членства пройдёт (он состоит в чате A), а физически он поставит/уберёт реакцию на сообщение из чата B, в котором может не состоять. Стоит либо валидировать принадлежность сообщения чату на уровне сервиса чатов, либо получать `chatId` из самого сообщения, а не из клиентского ввода.
+
+### 5.5. `emoji` не сохраняется в событии `message.reaction` при удалении
+
+Событие `action: 'remove'` не содержит `emoji` (он неизвестен сервису на момент удаления — см. 5.2), поэтому подписчики события (например, WebSocket-шлюз для обновления UI в реальном времени) не смогут показать, какая именно реакция была снята, без дополнительного запроса `getReactions`.
+
+### 5.6. Сообщения об ошибках на русском без i18n
+
+Аналогично `AuthService` и `ProfileService`, `ForbiddenException('Вы не состоите в этом чате')` захардкожено на русском языке — при мультиязычном клиенте потребуется либо перехват на фронтенде, либо вынесение сообщений в слой интернационализации.
+
+---
+
+## 6. Используемые ключи Redis
+
+| Ключ | Назначение | TTL |
+|---|---|---|
+| `reaction_lock:{messageId}:{userId}:{emoji}` | Дедупликация повторных запросов на добавление одной и той же реакции | 3 сек |
+| `reactions_cache:{messageId}` | Кеш агрегированной сводки реакций по сообщению | 60 сек |
+
+---
+
+## 7. Взаимодействие с другими сервисами/хранилищами
+
+```
+                         ┌──────────────────────┐
+   HTTP POST/DELETE/GET  │  ReactionsController  │
+  ────────────────────▶  └──────────┬────────────┘
+                                     │
+                                     ▼
+                         ┌──────────────────────┐
+                         │   ReactionsService    │
+                         └──┬─────┬─────┬────────┘
+                            │     │     │
+       Redis (лок, кеш) ◀──┘     │     └──▶ RabbitMQ: emit 'message.reaction'
+                                  │              (в очередь 'chat_events')
+                                  ▼
+                     gRPC → Chat-сервис
+                (isMember / getChatMembers)
+                                  │
+                                  ▼
+                     Cassandra: message_reactions
+                (INSERT / DELETE / SELECT)
 ```
 
-## Run tests
+- **Cassandra** — источник истины по реакциям (таблица `message_reactions`).
+- **Redis** — не источник истины, а слой оптимизации: кеш чтения (`reactions_cache`) и короткоживущая блокировка от дублей (`reaction_lock`).
+- **gRPC (Chat-сервис)** — авторитетный источник данных о членстве в чате; `ReactionsService` не хранит эту информацию локально.
+- **RabbitMQ** — исходящий канал уведомлений: `ReactionsService` публикует событие `message.reaction`, но не подписывается ни на одно событие сам (в отличие от `ProfileService`, который слушает `user.registered`).
 
-```bash
-# unit tests
-$ npm run test
+---
 
-# e2e tests
-$ npm run test:e2e
+## 8. Сводная таблица эндпоинтов
 
-# test coverage
-$ npm run test:cov
-```
-
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+| Метод сервиса | HTTP | Роут | Guard | Проверка членства в чате |
+|---|---|---|---|---|
+| `addReaction` | POST | `/messages/:messageId/reactions` | `JwtAuthGuard` | Да (`chatId` из тела, валидируется DTO) |
+| `removeReaction` | DELETE | `/messages/:messageId/reactions` | `JwtAuthGuard` | Да (`chatId` из тела, **без** валидации) |
+| `getReactions` | GET | `/messages/:messageId/reactions` | `JwtAuthGuard` | **Нет** (см. 5.3) |
