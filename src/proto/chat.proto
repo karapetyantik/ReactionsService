@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package chat;
+
+service ChatInternal {
+  rpc GetChatMembers (ChatIdRequest) returns (MembersResponse);
+  rpc IsMember (MembershipRequest) returns (MembershipResponse);
+}
+
+message ChatIdRequest {
+  string chatId = 1;
+}
+
+message MembersResponse {
+  repeated string memberIds = 1;
+}
+
+message MembershipRequest {
+  string chatId = 1;
+  string userId = 2;
+}
+
+message MembershipResponse {
+  bool isMember = 1;
+}
