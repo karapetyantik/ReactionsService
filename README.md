@@ -1,203 +1,145 @@
-# ReactionsService — документация
+# ReactionsService — подробная документация (все файлы)
 
-Модуль реакций (эмодзи) на сообщения в чате. Часть микросервиса чатов, отвечает за добавление, удаление и получение агрегированных реакций на сообщение, с хранением в Cassandra, кешированием в Redis, проверкой членства в чате через gRPC и рассылкой событий об изменении реакций через RabbitMQ.
-
----
-
-## 1. Общее описание
-
-Модуль `ReactionsModule` объединяет:
-
-- **`ReactionsController`** — REST-эндпоинты `POST/DELETE/GET /messages/:messageId/reactions`;
-- **`ReactionsService`** — бизнес-логика работы с реакциями;
-- **`ReactionDto`** — валидация тела запроса на добавление реакции.
-
-### 1.1. Зависимости `ReactionsService`
-
-| Зависимость | Назначение |
-|---|---|
-| `CassandraService` | Хранилище реакций (таблица `message_reactions`) — источник истины |
-| `ChatsClientService` | gRPC-клиент к сервису чатов: проверка членства (`isMember`) и получение списка участников (`getChatMembers`) |
-| `RedisService` | Кеш агрегированных реакций по сообщению + распределённая блокировка от дублей |
-| `ClientProxy` (`RABBITMQ_SERVICE`) | Публикация события `message.reaction` для доставки уведомлений участникам чата (например, через WebSocket-шлюз) |
-
-### 1.2. Импортируемые модули (`ReactionsModule`)
-
-- `RedisModule`, `CassandraModule`, `ChatsClientModule` — инфраструктурные зависимости.
-- `ClientsModule.registerAsync` с транспортом `Transport.RMQ` — асинхронная регистрация клиента RabbitMQ (`RABBITMQ_SERVICE`) с очередью `chat_events` (durable), URL брокера берётся из `RABBITMQ_URL`.
-
-### 1.3. Почему `ChatsClientService` используется, а не прямой запрос к БД чатов
-
-`ChatsClientService` — gRPC-клиент (`ClientGrpc`, сервис `ChatInternal`), инкапсулирующий два вызова:
-
-- `isMember(chatId, userId): Promise<boolean>` — проверка, состоит ли пользователь в чате;
-- `getChatMembers(chatId): Promise<string[]>` — список `userId` всех участников чата.
-
-Это межсервисное взаимодействие: `Reactions`-модуль не хранит и не знает структуру данных о чатах и их участниках — он делегирует это отдельному Chat-сервису по внутреннему gRPC-протоколу.
+Микросервис реакций (эмодзи) на сообщения. Хранилище — ScyllaDB/Cassandra. Проверяет членство в чате через gRPC-вызов к `ChatService`, кеширует агрегированные реакции в Redis, публикует события в общую очередь `chat_events`, которую разбирает `DeliveryController` в `ChatService` для доставки по WebSocket.
 
 ---
 
-## 2. `ReactionsController`
+## 1. Дерево модуля
 
-`@Controller('messages/:messageId/reactions')`, весь контроллер защищён `@UseGuards(JwtAuthGuard)` — все три эндпоинта требуют авторизации.
-
-### 2.1. `POST /messages/:messageId/reactions` — `add(req, messageId, dto)`
-
-- Тело запроса валидируется `ReactionDto`: `chatId` (UUID), `emoji` (строка 1–8 символов — с запасом под многобайтовые эмодзи-последовательности, например составные эмодзи с ZWJ).
-- `userId` берётся не из тела запроса, а из `req.user.userId` (payload JWT) — клиент не может добавить реакцию от чужого имени.
-- Делегирует в `reactionsService.addReaction(dto.chatId, messageId, req.user.userId, dto.emoji)`.
-
-### 2.2. `DELETE /messages/:messageId/reactions` — `remove(req, messageId, chatId)`
-
-- `chatId` читается напрямую из тела запроса через `@Body('chatId')`, **без DTO и без валидации** (в отличие от `add`).
-- Удаляет реакцию текущего пользователя (`req.user.userId`) на сообщение.
-
-### 2.3. `GET /messages/:messageId/reactions` — `list(messageId)`
-
-- Публичный (в рамках модуля) для любого авторизованного пользователя эндпоинт, возвращает агрегированную сводку реакций по сообщению. Проверка членства в чате **не выполняется** (см. раздел 5.3).
-
----
-
-## 3. `ReactionsService` — методы
-
-### 3.1. `addReaction(chatId, messageId, userId, emoji): Promise<{...}>`
-
-Добавляет (или заменяет) реакцию пользователя на сообщение.
-
-**Логика:**
-1. **Дедупликация быстрых повторных кликов.** Формирует ключ блокировки `reaction_lock:{messageId}:{userId}:{emoji}` и пытается атомарно установить его в Redis командой `SET ... EX 3 NX` (успех — только если ключа ещё нет). Если ключ уже существует (пользователь уже отправил ту же самую реакцию в последние 3 секунды) — метод сразу возвращает `{ chatId, messageId, userId, emoji, duplicate: true }`, не обращаясь к Cassandra и не эмитируя событие.
-2. **Проверка членства в чате.** Через gRPC (`chatsClient.isMember`) проверяет, что пользователь состоит в чате `chatId`. Если нет — `ForbiddenException('Вы не состоите в этом чате')`.
-3. **Запись в Cassandra.** Вставляет строку в `message_reactions` (`message_id`, `user_id`, `chat_id`, `emoji`, `created_at`), используя prepared statement.
-4. **Инвалидация кеша.** Удаляет `reactions_cache:{messageId}` из Redis, чтобы следующий `getReactions` перечитал актуальные данные.
-5. **Рассылка уведомления.** Получает список участников чата (`getChatMembers`) и публикует в RabbitMQ событие `message.reaction` с полями `{ chatId, messageId, userId, emoji, action: 'add', recipientIds }` — вероятно, для последующей доставки push/WebSocket-уведомлений подписанным клиентам.
-6. Возвращает `{ chatId, messageId, userId, emoji }` (без `duplicate`).
-
-**Исключения:**
-- `ForbiddenException` — пользователь не состоит в чате.
-
-**Особенность модели данных:** судя по запросу `DELETE ... WHERE message_id = ? AND user_id = ?` (без `emoji` в условии), таблица `message_reactions`, по всей видимости, имеет составной первичный ключ `(message_id, user_id)` — то есть **один пользователь может иметь только одну активную реакцию на сообщение**; повторный `addReaction` с другим `emoji` просто перезаписывает предыдущую реакцию того же пользователя (аналогично поведению реакций в Slack/Telegram).
-
-### 3.2. `removeReaction(chatId, messageId, userId): Promise<{...}>`
-
-Удаляет реакцию пользователя на сообщение.
-
-**Логика:**
-1. Проверка членства в чате (`isMember`) — иначе `ForbiddenException`.
-2. Удаляет строку из `message_reactions` по `message_id` и `user_id` (то есть удаляет **любую** реакцию пользователя на это сообщение, независимо от конкретного эмодзи — параметр `emoji` в метод даже не передаётся).
-3. Инвалидирует кеш `reactions_cache:{messageId}`.
-4. Получает участников чата и публикует событие `message.reaction` с `action: 'remove'` (без поля `emoji`, так как оно неизвестно на момент удаления).
-5. Возвращает `{ chatId, messageId, userId }`.
-
-**Отличие от `addReaction`:** здесь **нет** Redis-блокировки от дублей (`reaction_lock`) — повторный быстрый вызов `removeReaction` просто выполнит второй `DELETE` (идемпотентно на уровне Cassandra) и второй раз опубликует событие `message.reaction` с `action: 'remove'`, что может привести к дублирующимся уведомлениям на клиенте.
-
-### 3.3. `getReactions(messageId): Promise<Record<string, string[]>>`
-
-Возвращает агрегированную сводку реакций на сообщение в формате `{ emoji: [userId, userId, ...] }`.
-
-**Логика (cache-aside):**
-1. Пытается прочитать `reactions_cache:{messageId}` из Redis; при наличии — возвращает распарсенный JSON немедленно.
-2. При отсутствии кеша — выполняет `SELECT user_id, emoji FROM message_reactions WHERE message_id = ?` в Cassandra.
-3. Группирует результат по `emoji`, собирая массив `user_id` (приводя каждый к строке — `user_id` в Cassandra, вероятно, хранится как `uuid`/`timeuuid`, а не `text`).
-4. Сохраняет сводку в Redis с TTL 60 секунд.
-5. Возвращает сводку.
-
-**Важно:** в отличие от `ProfileService` (см. документацию `UserService`), здесь ключ кеша формируется и читается, и удаляется **одинаково и без опечаток** (`reactions_cache:${messageId}` везде) — инвалидация в `addReaction`/`removeReaction` работает корректно.
+```
+src/
+├── main.ts
+├── app.module.ts / app.controller.ts / app.service.ts
+├── common/
+│   ├── auth/       (jwt.strategy.ts, jwt-auth.guard.ts, auth.module.ts)
+│   ├── cassandra/  (cassandra.module.ts, cassandra.service.ts)
+│   └── redis/      (redis.module.ts, redis.service.ts)
+├── proto/chat.proto             — контракт ChatInternal (клиент здесь)
+└── modules/
+    ├── chats-client/
+    │   ├── chats-client.module.ts
+    │   └── chats-client.service.ts   — gRPC-клиент к ChatService
+    └── reactions/
+        ├── reactions.module.ts / reactions.controller.ts / reactions.service.ts
+        └── dto/reaction.dto.ts
+```
 
 ---
 
-## 4. `ReactionDto`
+## 2. `main.ts` — точка входа
+
+Самый простой bootstrap среди всех шести сервисов: только HTTP (`ValidationPipe` глобально, порт `PORT`, по умолчанию `3003`). Никаких RabbitMQ-консьюмеров или gRPC-серверов сервис не поднимает — он **только** HTTP-API + RabbitMQ-publisher + gRPC-**клиент** (к `ChatService`).
+
+## 3. `app.module.ts`
+
+Импортирует `ConfigModule` (global), `AuthModule`, `ChatsClientModule`, `ReactionsModule`, `RedisModule`. `CassandraModule` в `app.module.ts` напрямую не импортирован — он подключается внутри `ReactionsModule` (см. раздел 8).
+
+## 4. `common/auth/`, `common/cassandra/`, `common/redis/`
+
+Идентичны по коду соответствующим модулям в `ChatService` (тот же `JWT_SECRET`, тот же `cassandra-driver` с `SCYLLA_CONTACT_POINT`/`SCYLLA_KEYSPACE`, тот же `ioredis`).
+
+## 5. `proto/chat.proto`
+
+Тот же контракт `ChatInternal` (`GetChatMembers`, `IsMember`), что и в `ChatService` — здесь используется как основа для **клиента** (`ChatsClientService`), тогда как в `ChatService` этот же файл описывает реализацию **сервера**.
+
+---
+
+## 6. `modules/chats-client/` — gRPC-клиент к `ChatService`
+
+### `chats-client.module.ts`
+Регистрирует `ClientsModule` под именем `CHAT_GRPC_SERVICE`: транспорт `GRPC`, `package: 'chat'`, `protoPath: join(__dirname, '../proto/chat.proto')` (путь относительно скомпилированного `dist`), `url: CHAT_SERVICE_GRPC_URL` (обязательная переменная окружения — адрес gRPC-сервера `ChatService`, порт `5001` по умолчанию в самом `ChatService`).
+
+### `chats-client.service.ts`
+```ts
+interface ChatInternalGrpcService {
+  getChatMembers(data: { chatId: string }): Observable<{ memberIds: string[] }>;
+  isMember(data: { chatId: string; userId: string }): Observable<{ isMember: boolean }>;
+}
+```
+- `onModuleInit()` получает типизированный прокси через `client.getService<ChatInternalGrpcService>('ChatInternal')`.
+- `getChatMembers(chatId)` / `isMember(chatId, userId)` — тонкие обёртки, превращающие RxJS `Observable` в `Promise` через `firstValueFrom`.
+- Используется `ReactionsService` для проверки прав и получения списка получателей уведомлений.
+
+---
+
+## 7. `modules/reactions/dto/reaction.dto.ts`
 
 ```ts
 class ReactionDto {
-  @IsUUID()
-  chatId!: string;
-
-  @IsString()
-  @MinLength(1)
-  @MaxLength(8)
-  emoji!: string;
+  @IsUUID() chatId!: string;
+  @IsString() @MinLength(1) @MaxLength(8) emoji!: string;
 }
 ```
+Используется только в `POST`-запросе на добавление реакции (см. раздел 9).
 
-- `chatId` — обязателен, должен быть валидным UUID.
-- `emoji` — строка от 1 до 8 символов. Ограничение длины, вероятно, рассчитано на составные Unicode-эмодзи (например, эмодзи с модификатором тона кожи или ZWJ-последовательности могут занимать несколько code units), но явного `@Matches` на допустимый набор символов (только эмодзи) нет — теоретически можно отправить любую короткую строку (например, `":)"` или `"lol"`) как «эмодзи».
+## 8. `modules/reactions/reactions.module.ts`
 
-Используется только в `POST`-эндпоинте; `DELETE` принимает `chatId` без валидации вообще (см. ниже).
+Импортирует `RedisModule`, `CassandraModule`, `ChatsClientModule`, регистрирует `ClientsModule` (`RABBITMQ_SERVICE`, очередь `chat_events`, durable) — та же очередь, что использует `ChatService` для `message.sent`/`chat.read`; таким образом обе точки публикации событий (`ChatService` и `ReactionsService`) пишут в единую durable-очередь, из которой читает `DeliveryController` внутри `ChatService`.
+
+## 9. `modules/reactions/reactions.controller.ts` — REST `/messages/:messageId/reactions`
+
+Весь контроллер защищён `JwtAuthGuard`.
+
+| Метод | HTTP | Валидация тела | Проверка членства |
+|---|---|---|---|
+| `add` | POST | `ReactionDto` (`chatId` — UUID, `emoji` — 1–8 симв.) | Да (внутри сервиса) |
+| `remove` | DELETE | `chatId` — `@Body('chatId')`, **без DTO/валидации** | Да (внутри сервиса) |
+| `list` | GET | — | **Нет** |
+
+## 10. `modules/reactions/reactions.service.ts` — бизнес-логика
+
+### 10.1. `addReaction(chatId, messageId, userId, emoji)`
+1. Redis-блокировка от дублей: `SET reaction_lock:{messageId}:{userId}:{emoji} 1 EX 3 NX`. При неудаче (лок уже занят) — возвращает `{ ..., duplicate: true }` без обращения к Cassandra/gRPC.
+2. Проверка членства через gRPC (`chatsClient.isMember`) — иначе `ForbiddenException('Вы не состоите в этом чате')`.
+3. `INSERT INTO message_reactions (message_id, user_id, chat_id, emoji, created_at) VALUES (...)`.
+4. Инвалидация кеша: `DEL reactions_cache:{messageId}`.
+5. Получение участников чата (`chatsClient.getChatMembers`) и публикация `rabbitClient.emit('message.reaction', { chatId, messageId, userId, emoji, action: 'add', recipientIds })`.
+6. Возврат `{ chatId, messageId, userId, emoji }`.
+
+**Модель данных:** судя по `DELETE ... WHERE message_id = ? AND user_id = ?` (без `emoji`), таблица `message_reactions`, вероятно, имеет составной PK `(message_id, user_id)` — один пользователь может иметь только одну активную реакцию на сообщение; повторный `addReaction` с другим `emoji` перезаписывает предыдущую реакцию того же пользователя.
+
+### 10.2. `removeReaction(chatId, messageId, userId)`
+1. Проверка членства (`isMember`) — `ForbiddenException`, если нет.
+2. `DELETE FROM message_reactions WHERE message_id = ? AND user_id = ?` — удаляет **любую** реакцию пользователя на сообщение, независимо от конкретного эмодзи (параметр `emoji` в метод не передаётся).
+3. Инвалидация кеша, получение участников, публикация `message.reaction` с `action: 'remove'` (без поля `emoji` — оно неизвестно на момент удаления).
+
+**Отличие от `addReaction`:** здесь нет Redis-блокировки от дублей — повторный быстрый вызов приведёт к двум `DELETE` и двум событиям `action: 'remove'`.
+
+### 10.3. `getReactions(messageId)`
+Cache-aside: `GET reactions_cache:{messageId}` → при промахе `SELECT user_id, emoji FROM message_reactions WHERE message_id = ?`, группировка в `{ emoji: [userId, ...] }`, запись в кеш с TTL 60 сек.
+
+**В отличие от `ProfileService` (`UserService`), здесь ключ кеша формируется идентично во всех местах** (`reactions_cache:${messageId}` — без опечаток и лишних символов) — инвалидация работает корректно.
 
 ---
 
-## 5. Замечания и потенциальные проблемы
-
-### 5.1. Блокировка от дублей устанавливается до проверки прав
-
-В `addReaction` ключ `reaction_lock:...` выставляется **до** проверки `isMember`. Если пользователь не состоит в чате и запрос отклонён (`ForbiddenException`), лок всё равно занят на 3 секунды. Это не критично для безопасности, но может ненадолго помешать легитимному повторному запросу сразу после исправления членства (например, если пользователя добавили в чат прямо во время гонки запросов).
-
-### 5.2. `removeReaction` не защищён от дублей и не привязан к конкретному эмодзи
-
-`DELETE` удаляет **любую** реакцию пользователя на сообщение, не проверяя, какая именно реакция была установлена. В сочетании с отсутствием Redis-блокировки (как в `addReaction`) при двойном клике/повторной отправке возможна публикация двух одинаковых событий `message.reaction` с `action: 'remove'`.
-
-### 5.3. `chatId` в `remove` не валидируется, а в `list` членство не проверяется вовсе
-
-- В `POST` `chatId` проходит через `ReactionDto` (`@IsUUID()`), а в `DELETE` берётся напрямую (`@Body('chatId')`) без какой-либо валидации формата — некорректная строка дойдёт до gRPC-вызова `isMember` и, скорее всего, приведёт к необработанной ошибке на уровне транспорта, а не к аккуратному `400 Bad Request`.
-- В `GET /messages/:messageId/reactions` (`list`) вообще **не запрашивается `chatId`** и не выполняется проверка `isMember` — любой авторизованный пользователь системы (даже не состоящий в чате) может получить сводку реакций на любое `messageId`, если он его знает. Если реакции на сообщения в приватных чатах должны быть доступны только участникам, это дыра в контроле доступа, которую стоит закрыть (например, добавляя `chatId` как query-параметр и проверяя членство так же, как в `add`/`remove`).
-
-### 5.4. Нет проверки, что `messageId` действительно принадлежит `chatId`
-
-И `addReaction`, и `removeReaction` проверяют лишь то, что пользователь состоит **в указанном им самим `chatId`**, но никак не проверяют, что сообщение `messageId` действительно относится к этому чату. Технически участник чата A может отправить запрос с `chatId = <чат A>` и `messageId = <ID сообщения из чата B>` (если каким-то образом узнает этот ID) — проверка членства пройдёт (он состоит в чате A), а физически он поставит/уберёт реакцию на сообщение из чата B, в котором может не состоять. Стоит либо валидировать принадлежность сообщения чату на уровне сервиса чатов, либо получать `chatId` из самого сообщения, а не из клиентского ввода.
-
-### 5.5. `emoji` не сохраняется в событии `message.reaction` при удалении
-
-Событие `action: 'remove'` не содержит `emoji` (он неизвестен сервису на момент удаления — см. 5.2), поэтому подписчики события (например, WebSocket-шлюз для обновления UI в реальном времени) не смогут показать, какая именно реакция была снята, без дополнительного запроса `getReactions`.
-
-### 5.6. Сообщения об ошибках на русском без i18n
-
-Аналогично `AuthService` и `ProfileService`, `ForbiddenException('Вы не состоите в этом чате')` захардкожено на русском языке — при мультиязычном клиенте потребуется либо перехват на фронтенде, либо вынесение сообщений в слой интернационализации.
-
----
-
-## 6. Используемые ключи Redis
+## 11. Используемые ключи Redis
 
 | Ключ | Назначение | TTL |
 |---|---|---|
 | `reaction_lock:{messageId}:{userId}:{emoji}` | Дедупликация повторных запросов на добавление одной и той же реакции | 3 сек |
-| `reactions_cache:{messageId}` | Кеш агрегированной сводки реакций по сообщению | 60 сек |
+| `reactions_cache:{messageId}` | Кеш агрегированной сводки реакций | 60 сек |
 
 ---
 
-## 7. Взаимодействие с другими сервисами/хранилищами
+## 12. Интеграции — сводная таблица
 
-```
-                         ┌──────────────────────┐
-   HTTP POST/DELETE/GET  │  ReactionsController  │
-  ────────────────────▶  └──────────┬────────────┘
-                                     │
-                                     ▼
-                         ┌──────────────────────┐
-                         │   ReactionsService    │
-                         └──┬─────┬─────┬────────┘
-                            │     │     │
-       Redis (лок, кеш) ◀──┘     │     └──▶ RabbitMQ: emit 'message.reaction'
-                                  │              (в очередь 'chat_events')
-                                  ▼
-                     gRPC → Chat-сервис
-                (isMember / getChatMembers)
-                                  │
-                                  ▼
-                     Cassandra: message_reactions
-                (INSERT / DELETE / SELECT)
-```
+| Канал | Направление | Партнёр | Что передаётся |
+|---|---|---|---|
+| gRPC-клиент (`ChatInternal`) | вызывает | `ChatService` | `IsMember`, `GetChatMembers` |
+| RabbitMQ (`chat_events`) | публикует | `ChatService` (`DeliveryController`) | `message.reaction` |
+| Cassandra/ScyllaDB | хранилище | — | таблица `message_reactions` |
+| Redis | кеш + дедупликация | — | `reaction_lock:*`, `reactions_cache:*` |
 
-- **Cassandra** — источник истины по реакциям (таблица `message_reactions`).
-- **Redis** — не источник истины, а слой оптимизации: кеш чтения (`reactions_cache`) и короткоживущая блокировка от дублей (`reaction_lock`).
-- **gRPC (Chat-сервис)** — авторитетный источник данных о членстве в чате; `ReactionsService` не хранит эту информацию локально.
-- **RabbitMQ** — исходящий канал уведомлений: `ReactionsService` публикует событие `message.reaction`, но не подписывается ни на одно событие сам (в отличие от `ProfileService`, который слушает `user.registered`).
+Сервис не подписывается ни на одно событие RabbitMQ — только публикует.
 
 ---
 
-## 8. Сводная таблица эндпоинтов
+## 13. Сводные замечания
 
-| Метод сервиса | HTTP | Роут | Guard | Проверка членства в чате |
-|---|---|---|---|---|
-| `addReaction` | POST | `/messages/:messageId/reactions` | `JwtAuthGuard` | Да (`chatId` из тела, валидируется DTO) |
-| `removeReaction` | DELETE | `/messages/:messageId/reactions` | `JwtAuthGuard` | Да (`chatId` из тела, **без** валидации) |
-| `getReactions` | GET | `/messages/:messageId/reactions` | `JwtAuthGuard` | **Нет** (см. 5.3) |
+1. **`GET /messages/:messageId/reactions` не проверяет членство в чате** — любой авторизованный пользователь системы может получить сводку реакций на любое сообщение, зная его `messageId`, независимо от того, состоит ли он в соответствующем чате.
+2. **`isMember` проверяет членство только в переданном клиентом `chatId`, но не то, что `messageId` действительно принадлежит этому чату** — участник чата A теоретически может поставить/снять реакцию на сообщение из чата B, указав `chatId` чата A (если каким-то образом узнает `messageId` из чата B).
+3. **`DELETE`-эндпоинт принимает `chatId` без валидации** (`@Body('chatId')` вместо DTO), в отличие от `POST`, где `chatId` проверяется как UUID через `ReactionDto`.
+4. **`removeReaction` не защищена Redis-блокировкой от дублей** (в отличие от `addReaction`) и удаляет реакцию без учёта конкретного эмодзи — возможны дублирующиеся события `action: 'remove'` при двойных кликах.
+5. **Redis-лок в `addReaction` устанавливается до проверки прав** — если пользователь не состоит в чате, лок всё равно занят на 3 секунды, что может ненадолго помешать легитимному повторному запросу сразу после исправления членства.
+6. **Emoji не передаётся в событии `action: 'remove'`** — подписчики (`DeliveryController` в `ChatService`) не могут показать клиенту, какая именно реакция была снята, без дополнительного запроса к `GET /messages/:messageId/reactions`.
+7. Сообщения об ошибках — на русском, без i18n, как и во всех остальных сервисах системы.
