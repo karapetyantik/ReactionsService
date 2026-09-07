@@ -3,9 +3,9 @@ import { ClientsModule, Transport } from '@nestjs/microservices';
 import { ConfigService } from '@nestjs/config';
 import { ReactionsService } from './reactions.service';
 import { ReactionsController } from './reactions.controller';
-import { CassandraModule } from 'src/common/cassandra/cassandra.module';
+import { CassandraModule } from '@common/cassandra/cassandra.module';
 import { ChatsClientModule } from '../chats-client/chats-client.module';
-import { RedisModule } from 'src/common/redis/redis.module';
+import { RedisModule } from '@common/redis/redis.module';
 
 @Module({
   imports: [

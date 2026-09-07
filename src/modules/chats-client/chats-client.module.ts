@@ -13,7 +13,7 @@ import { ChatsClientService } from './chats-client.service';
           transport: Transport.GRPC,
           options: {
             package: 'chat',
-            protoPath: join(__dirname, '../proto/chat.proto'),
+            protoPath: join(process.cwd(), 'dist/proto/chat.proto'),
             url: config.getOrThrow<string>('CHAT_SERVICE_GRPC_URL'),
           },
         }),

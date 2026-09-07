@@ -8,9 +8,11 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { JwtAuthGuard } from 'src/common/auth/jwt-auth.guard';
+import { JwtAuthGuard } from '@common/auth/jwt-auth.guard';
+import { AuthenticatedRequest } from '@common/auth/authenticated-request.interface';
 import { ReactionsService } from './reactions.service';
 import { ReactionDto } from './dto/reaction.dto';
+import { RemoveReactionDto } from './dto/remove-reaction.dto';
 
 @UseGuards(JwtAuthGuard)
 @Controller('messages/:messageId/reactions')
@@ -19,7 +21,7 @@ export class ReactionsController {
 
   @Post()
   add(
-    @Req() req: any,
+    @Req() req: AuthenticatedRequest,
     @Param('messageId') messageId: string,
     @Body() dto: ReactionDto,
   ) {
@@ -33,14 +35,15 @@ export class ReactionsController {
 
   @Delete()
   remove(
-    @Req() req: any,
+    @Req() req: AuthenticatedRequest,
     @Param('messageId') messageId: string,
-    @Body('chatId') chatId: string,
+    @Body() dto: RemoveReactionDto,
   ) {
     return this.reactionsService.removeReaction(
-      chatId,
+      dto.chatId,
       messageId,
       req.user.userId,
+      dto.emoji,
     );
   }
 

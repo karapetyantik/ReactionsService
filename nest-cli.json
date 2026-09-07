@@ -4,10 +4,11 @@
   "sourceRoot": "src",
   "compilerOptions": {
     "deleteOutDir": true,
+    "builder": "tsc",
     "assets": [
       {
-        "include": "proto/chat.proto",
-        "outDir": "dist/modules",
+        "include": "proto/*.proto",
+        "outDir": "dist",
         "watchAssets": true
       }
     ]
