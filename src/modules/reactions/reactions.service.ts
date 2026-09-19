@@ -1,13 +1,21 @@
 import { Injectable, ForbiddenException, Inject } from '@nestjs/common';
 import { ClientProxy } from '@nestjs/microservices';
-import { CassandraService } from '@common/cassandra/cassandra.service';
 import { ChatsClientService } from '../chats-client/chats-client.service';
+import { CassandraService } from '@common/cassandra/cassandra.service';
 import { RedisService } from '@common/redis/redis.service';
 
 const REACTION_LOCK_TTL_SECONDS = 3;
 const REACTIONS_CACHE_TTL_SECONDS = 60;
 
 type ReactionAction = 'add' | 'remove';
+
+export interface ReactionResult {
+  chatId: string;
+  messageId: string;
+  userId: string;
+  emoji: string;
+  duplicate?: boolean;
+}
 
 @Injectable()
 export class ReactionsService {
@@ -23,7 +31,7 @@ export class ReactionsService {
     messageId: string,
     userId: string,
     emoji: string,
-  ) {
+  ): Promise<ReactionResult> {
     const acquired = await this.acquireLock('add', messageId, userId, emoji);
     if (!acquired) {
       return { chatId, messageId, userId, emoji, duplicate: true };
@@ -47,7 +55,7 @@ export class ReactionsService {
     messageId: string,
     userId: string,
     emoji: string,
-  ) {
+  ): Promise<ReactionResult> {
     const acquired = await this.acquireLock('remove', messageId, userId, emoji);
     if (!acquired) {
       return { chatId, messageId, userId, emoji, duplicate: true };
@@ -111,7 +119,7 @@ export class ReactionsService {
   ) {
     await this.redisService.client.del(this.reactionsCacheKey(messageId));
 
-    const recipientIds = await this.chatsClient.getChatMembers(chatId);
+    const recipientIds = await this.getChatMembersCached(chatId);
     this.rabbitClient.emit('message.reaction', {
       chatId,
       messageId,
@@ -120,6 +128,21 @@ export class ReactionsService {
       action,
       recipientIds,
     });
+  }
+
+  private async getChatMembersCached(chatId: string): Promise<string[]> {
+    const cacheKey = `chat_members:${chatId}`;
+    const cached = await this.redisService.client.get(cacheKey);
+    if (cached) return JSON.parse(cached) as string[];
+
+    const memberIds = await this.chatsClient.getChatMembers(chatId);
+    await this.redisService.client.set(
+      cacheKey,
+      JSON.stringify(memberIds),
+      'EX',
+      60,
+    );
+    return memberIds;
   }
 
   private reactionsCacheKey(messageId: string): string {

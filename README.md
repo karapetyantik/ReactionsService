@@ -18,7 +18,8 @@
 
 - **NestJS 11**, HTTP-only на вход, gRPC-клиент + RabbitMQ producer на выход
 - **ScyllaDB/Cassandra** (`cassandra-driver`) — таблица `message_reactions`
-- **Redis** — кэш агрегированной сводки реакций (TTL 60с) + debounce-блокировка на дублирующиеся запросы
+- **Redis** — кэш агрегированной сводки реакций (TTL 60с), кэш состава чата (TTL 60с + event-инвалидация), debounce-блокировка на дублирующиеся запросы
+- **RabbitMQ consumer** — слушает `reactions_events` (от ChatService) для инвалидации кэша состава чата
 - **gRPC** — клиент к `ChatInternal` (ChatService)
 - Path-алиасы: `@common/*`, `@modules/*`, `@proto/*`
 
@@ -28,6 +29,7 @@
 - Debounce одинаковых запросов (add/remove) через Redis-блокировку (`NX`, TTL 3с) — защита от двойного клика/дублирующихся сетевых ретраев.
 - Проверка членства в чате перед любым действием (`IsMember` по gRPC к ChatService).
 - Агрегированная сводка `{ emoji: [userId, ...] }` с кэшем в Redis.
+- Кэш состава чата (`chat_members:{chatId}`) для рассылки реакций больше не ждёт TTL при изменении состава: ChatService шлёт `chat.members.changed`, кэш сбрасывается немедленно — удалённый участник перестаёт получать `message.reaction` сразу, а не через до 60 секунд.
 
 ## API (`/messages/:messageId/reactions`)
 
@@ -48,6 +50,8 @@
 ## RabbitMQ
 
 **Публикует:** `message.reaction` — ChatService подхватывает это событие и доставляет его подключённым по WebSocket клиентам.
+
+**Потребляет:** `chat.members.changed` (очередь `reactions_events`, от ChatService) — сбрасывает `chat_members:{chatId}` в Redis.
 
 ## Переменные окружения
 
@@ -74,6 +78,7 @@ src/
 │   ├── chats-client/  # gRPC-клиент к ChatService + internal-key metadata
 │   └── reactions/
 │       ├── reactions.controller.ts / reactions.service.ts
+│       ├── chat-events.controller.ts   # chat.members.changed consumer
 │       └── dto/         # ReactionDto, RemoveReactionDto
 └── proto/
     └── chat.proto
